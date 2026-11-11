@@ -162,21 +162,33 @@ async function paypalRequest(method, endpoint, { body, requestId, preferRepresen
   return data;
 }
 
-async function createAuthorizeOrder({ amountValue = '40.00', currencyCode = 'USD', returnUrl, cancelUrl }) {
+async function createAuthorizeOrder({
+  amountValue = '40.00',
+  currencyCode = 'USD',
+  returnUrl,
+  cancelUrl,
+  description,
+  customId,
+  requestId,
+}) {
+  const purchaseUnit = {
+    description:
+      description || `Freelancer escrow authorization hold (${amountValue} ${currencyCode})`,
+    amount: {
+      currency_code: currencyCode,
+      value: amountValue,
+    },
+  };
+  if (customId) {
+    purchaseUnit.custom_id = customId;
+  }
+
   const order = await paypalRequest('POST', '/v2/checkout/orders', {
-    requestId: crypto.randomUUID(),
+    requestId: requestId || crypto.randomUUID(),
     preferRepresentation: true,
     body: {
       intent: 'AUTHORIZE',
-      purchase_units: [
-        {
-          description: `Freelancer escrow authorization hold (${amountValue} ${currencyCode})`,
-          amount: {
-            currency_code: currencyCode,
-            value: amountValue,
-          },
-        },
-      ],
+      purchase_units: [purchaseUnit],
       payment_source: {
         paypal: {
           experience_context: {
@@ -208,12 +220,12 @@ async function createAuthorizeOrder({ amountValue = '40.00', currencyCode = 'USD
   return { order, approvalUrl: approvalLink.href };
 }
 
-async function authorizeOrder(orderId) {
+async function authorizeOrder(orderId, { requestId } = {}) {
   const order = await paypalRequest(
     'POST',
     `/v2/checkout/orders/${encodeURIComponent(orderId)}/authorize`,
     {
-      requestId: crypto.randomUUID(),
+      requestId: requestId || crypto.randomUUID(),
       preferRepresentation: true,
       body: {},
     }
@@ -236,13 +248,13 @@ async function authorizeOrder(orderId) {
 
 async function captureAuthorization(
   authorizationId,
-  { amountValue = '30.00', currencyCode = 'USD', finalCapture = true } = {}
+  { amountValue = '30.00', currencyCode = 'USD', finalCapture = true, noteToPayer, requestId } = {}
 ) {
   return paypalRequest(
     'POST',
     `/v2/payments/authorizations/${encodeURIComponent(authorizationId)}/capture`,
     {
-      requestId: crypto.randomUUID(),
+      requestId: requestId || crypto.randomUUID(),
       preferRepresentation: true,
       body: {
         amount: {
@@ -250,10 +262,28 @@ async function captureAuthorization(
           value: amountValue,
         },
         final_capture: finalCapture,
-        note_to_payer: `Partial capture of ${amountValue} ${currencyCode} released to freelancer; remainder released back to buyer.`,
+        note_to_payer:
+          noteToPayer ||
+          `Partial capture of ${amountValue} ${currencyCode} released to freelancer; remainder released back to buyer.`,
       },
     }
   );
+}
+
+/**
+ * Voids an authorized payment so the entire held amount is released back to the buyer.
+ */
+async function voidAuthorization(authorizationId, { requestId } = {}) {
+  const data = await paypalRequest(
+    'POST',
+    `/v2/payments/authorizations/${encodeURIComponent(authorizationId)}/void`,
+    {
+      requestId: requestId || crypto.randomUUID(),
+      preferRepresentation: true,
+      body: {},
+    }
+  );
+  return data || { id: authorizationId, status: 'VOIDED' };
 }
 
 async function getAuthorization(authorizationId) {
@@ -271,6 +301,7 @@ module.exports = {
   createAuthorizeOrder,
   authorizeOrder,
   captureAuthorization,
+  voidAuthorization,
   getAuthorization,
 };
 

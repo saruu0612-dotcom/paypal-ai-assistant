@@ -147,3 +147,7 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# TrustLance runtime persistence
+data.json
+data.json.tmp
