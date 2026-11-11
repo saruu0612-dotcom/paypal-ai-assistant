@@ -2,6 +2,27 @@
 
 **AI-powered milestone escrow for freelancers and clients.**
 
+## Try it as a judge
+
+- **Live Demo:** https://trustlance-n5ti.onrender.com
+- **Cold-start note:** The app runs on Render's free tier, so the first request may take up to a minute to wake up.
+
+### Walkthrough Steps
+
+1. **Create a job (Client):** Enter a plain-English work description and a USD budget (or click a sample prompt), click **Generate AI Checklist**, optionally edit or remove criteria, and click **Create job**.
+2. **Accept the job (Freelancer):** On the `/job/:id` page, use the `Viewing as: Client | Freelancer` toggle at the top to switch to **Freelancer** and click **Accept Job**.
+3. **Fund the escrow (Client):** Switch the top toggle back to **Client**, click **Fund job**, and approve the PayPal Sandbox hold using the test buyer login below.
+4. **Submit & settle (Freelancer):** Switch back to **Freelancer** (you will see **Payment secured**), paste text/code or enter a public URL, and click **Submit Work for AI Review**. Gemini evaluates every checklist item and PayPal automatically captures the pro-rata payout (`final_capture: true`) or voids the hold if `$0.00` passes.
+
+### Sandbox Buyer Login
+
+- **Email:** `YOUR-PERSONAL-SANDBOX-EMAIL`
+- **Password:** `YOUR-SANDBOX-PASSWORD`
+
+*(These are PayPal Sandbox test credentials only — no real money is charged or moved.)*
+
+---
+
 ## The Problem & Who It Is For
 
 Freelancers and independent clients often face a trust gap on short-to-medium deliverables:
