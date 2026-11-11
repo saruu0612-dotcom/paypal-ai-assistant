@@ -16,8 +16,8 @@
 
 ### Sandbox Buyer Login
 
-- **Email:** `YOUR-PERSONAL-SANDBOX-EMAIL`
-- **Password:** `YOUR-SANDBOX-PASSWORD`
+- **Email:** sb-gdlyf53857906@personal.example.com
+- **Password:** wK7^l5DS
 
 *(These are PayPal Sandbox test credentials only — no real money is charged or moved.)*
 
@@ -121,12 +121,12 @@ TrustLance uses the official `@google/genai` SDK with strict JSON output mode (`
 
 ## Sandbox Test Buyer
 
-To test the PayPal Sandbox funding checkout flow, log in with a PayPal Sandbox **Personal (Buyer)** account from your [PayPal Developer Dashboard](https://developer.paypal.com/dashboard/accounts) when redirected to PayPal:
+To test the PayPal Sandbox funding checkout flow, log in with the sandbox buyer credentials above or create your own PayPal Sandbox **Personal (Buyer)** account in your [PayPal Developer Dashboard](https://developer.paypal.com/dashboard/accounts) when redirected to PayPal:
 
-- **Buyer Email:** `<your-sandbox-buyer-email@personal.example.com>`
-- **Buyer Password:** `<your-sandbox-buyer-password>`
+- **Buyer Email:** sb-gdlyf53857906@personal.example.com
+- **Buyer Password:** wK7^l5DS
 
-*(Never commit real Sandbox buyer passwords or API keys into this repository.)*
+*(These are PayPal Sandbox test credentials with no real money. Never commit live production credentials or API keys into this repository.)*
 
 ---
 
