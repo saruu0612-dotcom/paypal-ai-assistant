@@ -11,8 +11,10 @@ const {
   voidAuthorization,
 } = require('./paypal');
 const {
-  DEFAULT_GEMINI_MODEL,
   GeminiServiceError,
+  getGeminiHealth,
+  initGeminiModelDiscovery,
+  ensureModelsDiscovered,
   generateChecklist,
   evaluateSubmission,
 } = require('./gemini');
@@ -64,13 +66,14 @@ function getConfigStatus() {
     paypalReady = false;
   }
 
-  const geminiReady = Boolean((process.env.GEMINI_API_KEY || '').trim());
-  const geminiModel = (process.env.GEMINI_MODEL || '').trim() || DEFAULT_GEMINI_MODEL;
+  const geminiHealth = getGeminiHealth();
 
   return {
     paypalReady,
-    geminiReady,
-    geminiModel,
+    geminiReady: geminiHealth.ready,
+    activeGeminiModel: geminiHealth.activeModel,
+    geminiCandidates: geminiHealth.candidates,
+    geminiLastRefreshedAt: geminiHealth.lastRefreshedAt,
   };
 }
 
@@ -230,7 +233,8 @@ async function runReviewAndSettlement(job) {
 
 // --- TrustLance Page Routes ---
 
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
+  await ensureModelsDiscovered();
   res.send(
     renderHomePage({
       jobs: listJobs(),
@@ -239,7 +243,8 @@ app.get('/', (req, res) => {
   );
 });
 
-app.get('/job/:id', (req, res) => {
+app.get('/job/:id', async (req, res) => {
+  await ensureModelsDiscovered();
   const job = getJob(req.params.id);
   if (!job) {
     return res.status(404).send(
@@ -268,6 +273,19 @@ app.get('/job/:id', (req, res) => {
 });
 
 // --- TrustLance API Routes ---
+
+app.get('/api/health', async (_req, res) => {
+  await ensureModelsDiscovered();
+  const status = getConfigStatus();
+  return res.json({
+    ok: status.paypalReady && status.geminiReady,
+    activeModel: status.activeGeminiModel,
+    candidates: status.geminiCandidates,
+    geminiReady: status.geminiReady,
+    paypalConfigured: status.paypalReady,
+    lastRefreshedAt: status.geminiLastRefreshedAt,
+  });
+});
 
 app.post('/api/jobs/checklist', async (req, res) => {
   const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
@@ -711,7 +729,15 @@ app.listen(PORT, HOST, () => {
   console.log(`TrustLance listening on http://${HOST}:${PORT}`);
   console.log(`TrustLance base URL: ${baseUrl}`);
   console.log(`PayPal Sandbox test page available at ${baseUrl}/test`);
-  console.log(
-    `Config: PayPal=${status.paypalReady ? 'ready' : 'missing'}, Gemini=${status.geminiReady ? `ready (${status.geminiModel})` : 'missing'}`
-  );
+  console.log(`Config: PayPal=${status.paypalReady ? 'ready' : 'missing'}`);
+
+  initGeminiModelDiscovery()
+    .then((geminiHealth) => {
+      console.log(
+        `Gemini status: ${geminiHealth.ready ? `ready (active=${geminiHealth.activeModel})` : 'unavailable'}`
+      );
+    })
+    .catch((err) => {
+      console.warn('Gemini initial discovery error:', err?.message || err);
+    });
 });

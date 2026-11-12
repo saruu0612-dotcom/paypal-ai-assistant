@@ -76,9 +76,9 @@ function renderLayout({ title, configStatus, bodyHtml }) {
             <span class="env-dot ${paypalReady ? 'ready' : 'missing'}"></span>
             PayPal ${paypalReady ? 'Ready' : 'Not Set'}
           </span>
-          <span class="env-pill" title="Gemini AI configuration status">
+          <span class="env-pill" title="Gemini AI service availability">
             <span class="env-dot ${geminiReady ? 'ready' : 'missing'}"></span>
-            Gemini ${geminiReady ? 'Ready' : 'Not Set'}
+            Gemini ${geminiReady ? 'Ready' : 'Unavailable'}
           </span>
         </div>
       </nav>
@@ -98,7 +98,7 @@ function renderHomePage({ jobs, configStatus }) {
     envWarnings.push('PayPal Sandbox credentials (<code>PAYPAL_CLIENT_ID</code>, <code>PAYPAL_SECRET</code>) are missing in <code>.env</code>.');
   }
   if (!configStatus.geminiReady) {
-    envWarnings.push('Gemini API key (<code>GEMINI_API_KEY</code>) is missing in <code>.env</code>.');
+    envWarnings.push('AI verification service is currently unavailable.');
   }
 
   const warningHtml =

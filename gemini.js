@@ -5,11 +5,12 @@ const DEFAULT_FALLBACK_MODELS = [
   'gemini-3.7-flash',
   'gemini-3.6-flash',
   'gemini-3.5-flash',
-  'gemini-2.5-flash',
 ];
-const MAX_TRANSIENT_RETRIES = 3;
-const RETRY_DELAY_MS = 2000;
+const MAX_TRANSIENT_RETRIES = 2;
+const RETRY_DELAY_MS = 1200;
 const REQUEST_TIMEOUT_MS = 20000;
+const MODEL_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+const FRIENDLY_AI_BUSY_MESSAGE = 'The AI service is busy. Please try again in a moment.';
 
 class GeminiServiceError extends Error {
   constructor(message, { status = 502, code = 'GEMINI_ERROR', retryable = false } = {}) {
@@ -28,39 +29,302 @@ class InvalidAiResponseError extends Error {
   }
 }
 
-function getGeminiConfig() {
-  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-  const model = (process.env.GEMINI_MODEL || '').trim() || DEFAULT_GEMINI_MODEL;
+const discoveryState = {
+  discoveredAll: [],
+  discoveredFlash: [],
+  candidates: [],
+  lastWorkingModel: null,
+  unavailableModels: new Set(),
+  discoveryOk: false,
+  lastRefreshedAt: null,
+  inFlightRefresh: null,
+  intervalHandle: null,
+  lastEnvSignature: null,
+};
 
+function normalizeModelName(name) {
+  return String(name || '')
+    .trim()
+    .replace(/^models\//i, '');
+}
+
+function getConfiguredEnvModels() {
+  const configuredPrimary = normalizeModelName(process.env.GEMINI_MODEL || '');
   const rawFallbacks = (process.env.GEMINI_FALLBACK_MODELS || '').trim();
-  const parsedFallbacks = rawFallbacks
+  const configuredFallbacks = rawFallbacks
     ? rawFallbacks
         .split(',')
-        .map((m) => m.trim())
+        .map((m) => normalizeModelName(m))
         .filter(Boolean)
-    : DEFAULT_FALLBACK_MODELS;
+    : [];
 
-  const seen = new Set([model]);
-  const fallbackModels = [];
-  for (const candidate of parsedFallbacks) {
-    if (!seen.has(candidate)) {
-      seen.add(candidate);
-      fallbackModels.push(candidate);
+  return {
+    configuredPrimary: configuredPrimary || null,
+    configuredFallbacks,
+  };
+}
+
+function parseVersionNumbers(modelName) {
+  const match = String(modelName || '').match(/(\d+)(?:\.(\d+))?/);
+  if (!match) return [0, 0];
+  return [Number(match[1]) || 0, Number(match[2]) || 0];
+}
+
+function isTextFlashModelName(modelName) {
+  const lower = String(modelName || '').toLowerCase();
+  if (!lower.includes('flash')) return false;
+  if (/(?:-image|-tts|-audio|-transcribe|-live)(?:-|$)/.test(lower)) {
+    return false;
+  }
+  return true;
+}
+
+function compareFlashModels(a, b) {
+  if (a === DEFAULT_GEMINI_MODEL && b !== DEFAULT_GEMINI_MODEL) return -1;
+  if (b === DEFAULT_GEMINI_MODEL && a !== DEFAULT_GEMINI_MODEL) return 1;
+
+  const [majorA, minorA] = parseVersionNumbers(a);
+  const [majorB, minorB] = parseVersionNumbers(b);
+  if (majorA !== majorB) return majorB - majorA;
+  if (minorA !== minorB) return minorB - minorA;
+
+  const scoreVariant = (name) => {
+    const lower = name.toLowerCase();
+    let score = 0;
+    if (!lower.includes('lite')) score += 4;
+    if (!lower.includes('preview')) score += 2;
+    if (!lower.includes('omni')) score += 1;
+    return score;
+  };
+  const variantDiff = scoreVariant(b) - scoreVariant(a);
+  if (variantDiff !== 0) return variantDiff;
+
+  return b.localeCompare(a);
+}
+
+function supportsGenerateContent(modelObj) {
+  const actions = Array.isArray(modelObj?.supportedActions)
+    ? modelObj.supportedActions
+    : Array.isArray(modelObj?.supportedGenerationMethods)
+      ? modelObj.supportedGenerationMethods
+      : null;
+
+  if (!actions) return false;
+  return actions.some((action) => String(action).toLowerCase() === 'generatecontent');
+}
+
+function buildRankedCandidateList() {
+  const { configuredPrimary, configuredFallbacks } = getConfiguredEnvModels();
+  const discoveredAllSet = new Set(discoveryState.discoveredAll);
+  const hasDiscovered = discoveryState.discoveryOk && discoveredAllSet.size > 0;
+  const unavailable = discoveryState.unavailableModels;
+
+  const envExplicit = [];
+  if (configuredPrimary) envExplicit.push(configuredPrimary);
+  for (const fb of configuredFallbacks) envExplicit.push(fb);
+
+  const ordered = [];
+  const seen = new Set();
+  const addIfUsable = (modelName) => {
+    const normalized = normalizeModelName(modelName);
+    if (!normalized || seen.has(normalized) || unavailable.has(normalized)) return;
+    if (hasDiscovered && !discoveredAllSet.has(normalized)) return;
+    seen.add(normalized);
+    ordered.push(normalized);
+  };
+
+  // 1. Explicitly configured GEMINI_MODEL and GEMINI_FALLBACK_MODELS first (when not known retired).
+  for (const cfgModel of envExplicit) {
+    addIfUsable(cfgModel);
+  }
+
+  // 2. Discovered flash models supporting generateContent (gemini-3.8-flash preferred, newest first).
+  for (const flashModel of discoveryState.discoveredFlash) {
+    addIfUsable(flashModel);
+  }
+
+  // 3. Fallback defaults if live discovery has not populated candidates yet.
+  if (ordered.length === 0) {
+    addIfUsable(DEFAULT_GEMINI_MODEL);
+    for (const defModel of DEFAULT_FALLBACK_MODELS) {
+      addIfUsable(defModel);
     }
   }
 
-  if (!apiKey) {
-    throw new GeminiServiceError(
-      'Gemini AI is not configured yet. Please add GEMINI_API_KEY to your .env file.',
-      { status: 503, code: 'GEMINI_MISSING_KEY' }
-    );
+  discoveryState.candidates = ordered;
+  return ordered;
+}
+
+function warnIfConfiguredModelsMissing(discoveredAllSet) {
+  const { configuredPrimary, configuredFallbacks } = getConfiguredEnvModels();
+  const configuredList = [
+    ...(configuredPrimary ? [configuredPrimary] : []),
+    ...configuredFallbacks,
+  ];
+  for (const cfgModel of configuredList) {
+    if (!discoveredAllSet.has(cfgModel) || discoveryState.unavailableModels.has(cfgModel)) {
+      console.warn(
+        `[Gemini] Configured model "${cfgModel}" is retired or unavailable for generateContent; using ranked fallback candidates.`
+      );
+    }
   }
+}
+
+async function refreshAvailableModels({ aiOverride } = {}) {
+  if (discoveryState.inFlightRefresh) {
+    return discoveryState.inFlightRefresh;
+  }
+
+  discoveryState.inFlightRefresh = (async () => {
+    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+    if (!apiKey && !aiOverride) {
+      discoveryState.discoveryOk = false;
+      discoveryState.discoveredAll = [];
+      discoveryState.discoveredFlash = [];
+      discoveryState.candidates = [];
+      return getGeminiHealth();
+    }
+
+    try {
+      const ai = aiOverride || new GoogleGenAI({ apiKey });
+      const pager = await ai.models.list();
+      const discoveredAll = [];
+
+      for await (const modelObj of pager) {
+        if (!supportsGenerateContent(modelObj)) continue;
+        const normalized = normalizeModelName(modelObj?.name);
+        if (normalized) {
+          discoveredAll.push(normalized);
+        }
+      }
+
+      const uniqueAll = Array.from(new Set(discoveredAll));
+      const discoveredFlash = uniqueAll
+        .filter((name) => isTextFlashModelName(name) && !discoveryState.unavailableModels.has(name))
+        .sort(compareFlashModels);
+
+      discoveryState.discoveredAll = uniqueAll;
+      discoveryState.discoveredFlash = discoveredFlash;
+      discoveryState.discoveryOk = uniqueAll.length > 0;
+      discoveryState.lastRefreshedAt = new Date().toISOString();
+
+      const { configuredPrimary, configuredFallbacks } = getConfiguredEnvModels();
+      discoveryState.lastEnvSignature = `${configuredPrimary || ''}|${configuredFallbacks.join(',')}`;
+      warnIfConfiguredModelsMissing(new Set(uniqueAll));
+      const ranked = buildRankedCandidateList();
+      console.log(
+        `[Gemini] Model discovery complete: ${ranked.length} candidate(s) ready (top: ${ranked[0] || 'none'}).`
+      );
+    } catch (err) {
+      discoveryState.discoveryOk = false;
+      buildRankedCandidateList();
+      console.warn(
+        `[Gemini] Model discovery failed (${err?.message || err}); using ranked fallback list.`
+      );
+    } finally {
+      discoveryState.inFlightRefresh = null;
+    }
+
+    return getGeminiHealth();
+  })();
+
+  return discoveryState.inFlightRefresh;
+}
+
+function initGeminiModelDiscovery() {
+  if (!discoveryState.intervalHandle) {
+    discoveryState.intervalHandle = setInterval(() => {
+      refreshAvailableModels().catch(() => {});
+    }, MODEL_REFRESH_INTERVAL_MS);
+    if (typeof discoveryState.intervalHandle.unref === 'function') {
+      discoveryState.intervalHandle.unref();
+    }
+  }
+  return refreshAvailableModels();
+}
+
+async function ensureModelsDiscovered() {
+  if (discoveryState.inFlightRefresh) {
+    await discoveryState.inFlightRefresh;
+  } else if (!discoveryState.lastRefreshedAt && (process.env.GEMINI_API_KEY || '').trim()) {
+    await refreshAvailableModels();
+  }
+  return getGeminiHealth();
+}
+
+function syncEnvChangesIfNeeded() {
+  const { configuredPrimary, configuredFallbacks } = getConfiguredEnvModels();
+  const signature = `${configuredPrimary || ''}|${configuredFallbacks.join(',')}`;
+  if (discoveryState.lastEnvSignature !== signature) {
+    discoveryState.lastEnvSignature = signature;
+    if (discoveryState.discoveryOk) {
+      warnIfConfiguredModelsMissing(new Set(discoveryState.discoveredAll));
+    }
+    buildRankedCandidateList();
+  }
+}
+
+function getRuntimeAttemptModels() {
+  syncEnvChangesIfNeeded();
+  const ranked = buildRankedCandidateList();
+  const last = discoveryState.lastWorkingModel;
+  if (last && !discoveryState.unavailableModels.has(last)) {
+    return [last, ...ranked.filter((m) => m !== last)];
+  }
+  return ranked;
+}
+
+function getGeminiHealth() {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey) {
+    return {
+      ready: false,
+      activeModel: null,
+      candidates: [],
+      configuredModel: (process.env.GEMINI_MODEL || '').trim() || DEFAULT_GEMINI_MODEL,
+      discoveryOk: false,
+      lastRefreshedAt: discoveryState.lastRefreshedAt,
+    };
+  }
+
+  syncEnvChangesIfNeeded();
+  const ranked = getRuntimeAttemptModels();
+  const hasRealWorkingModel =
+    Boolean(discoveryState.lastWorkingModel && !discoveryState.unavailableModels.has(discoveryState.lastWorkingModel)) ||
+    (discoveryState.discoveryOk && ranked.length > 0);
+  const activeModel = hasRealWorkingModel ? ranked[0] || null : null;
+
+  return {
+    ready: hasRealWorkingModel,
+    activeModel,
+    candidates: ranked,
+    configuredModel: (process.env.GEMINI_MODEL || '').trim() || DEFAULT_GEMINI_MODEL,
+    discoveryOk: discoveryState.discoveryOk,
+    lastRefreshedAt: discoveryState.lastRefreshedAt,
+  };
+}
+
+function getGeminiConfig() {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  const { configuredPrimary, configuredFallbacks } = getConfiguredEnvModels();
+  const model = configuredPrimary || DEFAULT_GEMINI_MODEL;
+
+  if (!apiKey) {
+    console.warn('[Gemini] Request attempted without GEMINI_API_KEY configured.');
+    throw new GeminiServiceError(FRIENDLY_AI_BUSY_MESSAGE, {
+      status: 503,
+      code: 'GEMINI_MISSING_KEY',
+      retryable: false,
+    });
+  }
+
+  const models = getRuntimeAttemptModels();
 
   return {
     apiKey,
     model,
-    fallbackModels,
-    models: [model, ...fallbackModels],
+    fallbackModels: configuredFallbacks.length > 0 ? configuredFallbacks : DEFAULT_FALLBACK_MODELS,
+    models,
   };
 }
 
@@ -72,16 +336,16 @@ function getClient() {
   };
 }
 
-function classifyGeminiError(err, model) {
+function classifyGeminiError(err) {
   if (err instanceof GeminiServiceError) {
-    return { error: err, isTransient: err.retryable, isModelNotFound: false };
+    return { error: err, isTransient: err.retryable, isModelUnavailable: false, isAuthError: false };
   }
 
   const rawMsg = String(err?.message || '');
   const lower = rawMsg.toLowerCase();
   const nameLower = String(err?.name || '').toLowerCase();
   const causeCode = String(err?.cause?.code || err?.code || '').toLowerCase();
-  const statusCode = Number(err?.status || err?.statusCode) || 0;
+  const statusCode = Number(err?.status || err?.statusCode || err?.error?.code) || 0;
 
   if (
     statusCode === 401 ||
@@ -90,23 +354,34 @@ function classifyGeminiError(err, model) {
     lower.includes('permission_denied')
   ) {
     return {
-      error: new GeminiServiceError(
-        'Gemini API authentication failed. Please verify your GEMINI_API_KEY in .env.',
-        { status: 502, code: 'GEMINI_AUTH_ERROR', retryable: false }
-      ),
+      error: new GeminiServiceError(FRIENDLY_AI_BUSY_MESSAGE, {
+        status: 503,
+        code: 'GEMINI_AUTH_ERROR',
+        retryable: false,
+      }),
       isTransient: false,
-      isModelNotFound: false,
+      isModelUnavailable: false,
+      isAuthError: true,
     };
   }
 
-  if (statusCode === 404 || (lower.includes('model') && lower.includes('not found'))) {
+  if (
+    statusCode === 404 ||
+    lower.includes('not_found') ||
+    lower.includes('not found') ||
+    lower.includes('no longer available') ||
+    lower.includes('is deprecated') ||
+    lower.includes('"code":404')
+  ) {
     return {
-      error: new GeminiServiceError(
-        `Configured Gemini model "${model}" was unavailable. Check GEMINI_MODEL in .env or use ${DEFAULT_GEMINI_MODEL}.`,
-        { status: 502, code: 'GEMINI_MODEL_ERROR', retryable: false }
-      ),
+      error: new GeminiServiceError(FRIENDLY_AI_BUSY_MESSAGE, {
+        status: 503,
+        code: 'GEMINI_MODEL_UNAVAILABLE',
+        retryable: false,
+      }),
       isTransient: false,
-      isModelNotFound: true,
+      isModelUnavailable: true,
+      isAuthError: false,
     };
   }
 
@@ -114,15 +389,18 @@ function classifyGeminiError(err, model) {
     statusCode === 503 ||
     lower.includes('unavailable') ||
     lower.includes('high demand') ||
-    lower.includes('overloaded')
+    lower.includes('overloaded') ||
+    lower.includes('"code":503')
   ) {
     return {
-      error: new GeminiServiceError(
-        'Gemini AI is temporarily experiencing high demand. Please try again in a moment.',
-        { status: 503, code: 'GEMINI_UNAVAILABLE', retryable: true }
-      ),
+      error: new GeminiServiceError(FRIENDLY_AI_BUSY_MESSAGE, {
+        status: 503,
+        code: 'GEMINI_UNAVAILABLE',
+        retryable: true,
+      }),
       isTransient: true,
-      isModelNotFound: false,
+      isModelUnavailable: false,
+      isAuthError: false,
     };
   }
 
@@ -130,15 +408,18 @@ function classifyGeminiError(err, model) {
     statusCode === 429 ||
     lower.includes('quota') ||
     lower.includes('rate limit') ||
-    lower.includes('resource_exhausted')
+    lower.includes('resource_exhausted') ||
+    lower.includes('"code":429')
   ) {
     return {
-      error: new GeminiServiceError(
-        'Gemini AI rate limit reached. Please wait a moment and try again.',
-        { status: 429, code: 'GEMINI_RATE_LIMIT', retryable: true }
-      ),
+      error: new GeminiServiceError(FRIENDLY_AI_BUSY_MESSAGE, {
+        status: 429,
+        code: 'GEMINI_RATE_LIMIT',
+        retryable: true,
+      }),
       isTransient: true,
-      isModelNotFound: false,
+      isModelUnavailable: false,
+      isAuthError: false,
     };
   }
 
@@ -151,30 +432,38 @@ function classifyGeminiError(err, model) {
     lower.includes('timed out') ||
     lower.includes('deadline') ||
     lower.includes('"code":504') ||
+    lower.includes('"code":408') ||
     lower.includes('aborted') ||
     causeCode.includes('timeout') ||
     causeCode === 'etimedout' ||
     causeCode === 'econnreset' ||
+    causeCode === 'econnrefused' ||
+    causeCode === 'enotfound' ||
+    causeCode === 'eai_again' ||
     lower.includes('fetch') ||
     lower.includes('network')
   ) {
     return {
-      error: new GeminiServiceError(
-        'Request to Gemini AI timed out or encountered a network interruption. Please try again.',
-        { status: 504, code: 'GEMINI_TIMEOUT', retryable: true }
-      ),
+      error: new GeminiServiceError(FRIENDLY_AI_BUSY_MESSAGE, {
+        status: 504,
+        code: 'GEMINI_TIMEOUT',
+        retryable: true,
+      }),
       isTransient: true,
-      isModelNotFound: false,
+      isModelUnavailable: false,
+      isAuthError: false,
     };
   }
 
   return {
-    error: new GeminiServiceError(
-      'Gemini AI failed to process this request. Please try again in a moment.',
-      { status: 502, code: 'GEMINI_API_ERROR', retryable: false }
-    ),
-    isTransient: false,
-    isModelNotFound: false,
+    error: new GeminiServiceError(FRIENDLY_AI_BUSY_MESSAGE, {
+      status: 503,
+      code: 'GEMINI_API_ERROR',
+      retryable: true,
+    }),
+    isTransient: true,
+    isModelUnavailable: false,
+    isAuthError: false,
   };
 }
 
@@ -204,15 +493,23 @@ async function callSingleModelWithRetries(
       });
       return { ok: true, response };
     } catch (err) {
-      const classified = classifyGeminiError(err, model);
+      const classified = classifyGeminiError(err);
       lastClassified = classified;
+
+      if (classified.isModelUnavailable) {
+        console.warn(
+          `[Gemini] Model "${model}" is retired or unavailable (${err?.message || classified.error.code}); skipping to next candidate.`
+        );
+        return { ok: false, classified };
+      }
+
       console.error(
-        `Gemini call error (model=${model}, try=${retry + 1}/${maxRetries + 1}, code=${classified.error.code}):`,
+        `[Gemini] Call error (model=${model}, try=${retry + 1}/${maxRetries + 1}, code=${classified.error.code}):`,
         err?.message || err
       );
 
       if (classified.isTransient && retry < maxRetries) {
-        console.warn(`Retrying ${model} in ${retryDelayMs}ms...`);
+        console.warn(`[Gemini] Retrying busy model "${model}" in ${retryDelayMs}ms...`);
         await sleep(retryDelayMs);
         continue;
       }
@@ -226,16 +523,25 @@ async function callSingleModelWithRetries(
 
 /**
  * Calls Gemini in strict JSON mode with:
- * - Up to 3 retries (2s delay) per model on 503, 429, or timeout/network errors,
- * - Automatic fallback through GEMINI_FALLBACK_MODELS if a model remains unavailable,
+ * - Ranked candidates (last working model first, then env config, then discovered flash models newest first),
+ * - Immediate skip on 404/NOT_FOUND/"no longer available" and 1-2 short retries on 503/429/timeout before skipping,
  * - 1 automatic validation retry if the AI returns malformed or schema-invalid JSON.
  */
 async function callGeminiJsonWithRetry(
   { systemInstruction, contents, responseJsonSchema, validate },
   retryOptions = {}
 ) {
-  const { ai, models } = getClient();
-  let lastTransientError = null;
+  if (!discoveryState.lastRefreshedAt && !retryOptions.aiOverride) {
+    await ensureModelsDiscovered();
+  }
+
+  const clientInfo = retryOptions.aiOverride
+    ? {
+        ai: retryOptions.aiOverride,
+        models: retryOptions.modelsOverride || getRuntimeAttemptModels(),
+      }
+    : getClient();
+  const { ai, models } = clientInfo;
 
   for (let modelIndex = 0; modelIndex < models.length; modelIndex += 1) {
     const model = models[modelIndex];
@@ -254,24 +560,33 @@ async function callGeminiJsonWithRetry(
       );
 
       if (!callResult.ok) {
-        const { error, isTransient, isModelNotFound } = callResult.classified;
-        if (isTransient || isModelNotFound) {
-          lastTransientError = error;
-          shouldFallbackToNextModel = true;
-          if (modelIndex < models.length - 1) {
-            console.warn(
-              `Falling back from ${model} to ${models[modelIndex + 1]} after ${error.code}.`
-            );
+        const { error, isModelUnavailable, isAuthError } = callResult.classified;
+        if (isModelUnavailable) {
+          discoveryState.unavailableModels.add(model);
+          if (discoveryState.lastWorkingModel === model) {
+            discoveryState.lastWorkingModel = null;
           }
-          break;
+          buildRankedCandidateList();
         }
-        throw error;
+
+        if (isAuthError) {
+          console.error('[Gemini] Authentication error from Gemini API. Verify API credentials on server.');
+          throw error;
+        }
+
+        shouldFallbackToNextModel = true;
+        if (modelIndex < models.length - 1) {
+          console.warn(
+            `[Gemini] Falling back from "${model}" to "${models[modelIndex + 1]}" (${error.code}).`
+          );
+        }
+        break;
       }
 
       const rawText = typeof callResult.response?.text === 'string' ? callResult.response.text.trim() : '';
       if (!rawText) {
         lastValidationError = new InvalidAiResponseError('Gemini returned an empty response.');
-        console.warn(`Gemini (${model}) JSON attempt ${jsonAttempt} returned empty text.`);
+        console.warn(`[Gemini] (${model}) JSON attempt ${jsonAttempt} returned empty text.`);
         continue;
       }
 
@@ -280,38 +595,37 @@ async function callGeminiJsonWithRetry(
         parsed = JSON.parse(rawText);
       } catch {
         lastValidationError = new InvalidAiResponseError('Response was not valid JSON.');
-        console.warn(`Gemini (${model}) JSON attempt ${jsonAttempt} returned unparseable JSON.`);
+        console.warn(`[Gemini] (${model}) JSON attempt ${jsonAttempt} returned unparseable JSON.`);
         continue;
       }
 
       try {
-        return validate(parsed);
+        const validated = validate(parsed);
+        discoveryState.lastWorkingModel = model;
+        return validated;
       } catch (validationErr) {
         lastValidationError =
           validationErr instanceof InvalidAiResponseError
             ? validationErr
             : new InvalidAiResponseError(validationErr?.message || 'Validation failed.');
         console.warn(
-          `Gemini (${model}) JSON attempt ${jsonAttempt} failed validation: ${lastValidationError.message}`
+          `[Gemini] (${model}) JSON attempt ${jsonAttempt} failed validation: ${lastValidationError.message}`
         );
       }
     }
 
-    if (!shouldFallbackToNextModel) {
-      throw new GeminiServiceError(
-        'AI returned an invalid response format twice. Please try again.',
-        { status: 502, code: 'GEMINI_INVALID_JSON', retryable: true }
+    if (!shouldFallbackToNextModel && modelIndex < models.length - 1) {
+      console.warn(
+        `[Gemini] "${model}" failed JSON validation twice; falling back to "${models[modelIndex + 1]}".`
       );
     }
   }
 
-  throw (
-    lastTransientError ||
-    new GeminiServiceError(
-      'Gemini AI is temporarily unavailable across all configured models. Please try again.',
-      { status: 503, code: 'GEMINI_ALL_MODELS_FAILED', retryable: true }
-    )
-  );
+  throw new GeminiServiceError(FRIENDLY_AI_BUSY_MESSAGE, {
+    status: 503,
+    code: 'GEMINI_ALL_MODELS_FAILED',
+    retryable: true,
+  });
 }
 
 const CHECKLIST_SCHEMA = {
@@ -540,14 +854,39 @@ async function evaluateSubmission(
   );
 }
 
+function resetDiscoveryStateForTests() {
+  discoveryState.discoveredAll = [];
+  discoveryState.discoveredFlash = [];
+  discoveryState.candidates = [];
+  discoveryState.lastWorkingModel = null;
+  discoveryState.unavailableModels.clear();
+  discoveryState.discoveryOk = false;
+  discoveryState.lastRefreshedAt = null;
+  discoveryState.inFlightRefresh = null;
+  discoveryState.lastEnvSignature = null;
+}
+
 module.exports = {
   DEFAULT_GEMINI_MODEL,
   DEFAULT_FALLBACK_MODELS,
   MAX_TRANSIENT_RETRIES,
   RETRY_DELAY_MS,
   REQUEST_TIMEOUT_MS,
+  MODEL_REFRESH_INTERVAL_MS,
+  FRIENDLY_AI_BUSY_MESSAGE,
   GeminiServiceError,
   getGeminiConfig,
+  getGeminiHealth,
+  initGeminiModelDiscovery,
+  refreshAvailableModels,
+  ensureModelsDiscovered,
+  callGeminiJsonWithRetry,
   generateChecklist,
   evaluateSubmission,
+  _internal: {
+    compareFlashModels,
+    isTextFlashModelName,
+    classifyGeminiError,
+    resetDiscoveryStateForTests,
+  },
 };

@@ -69,8 +69,8 @@ TrustLance uses the official `@google/genai` SDK with strict JSON output mode (`
 2. **Deliverable Evaluation (`evaluateSubmission`)**: Evaluates the submitted text/code or fetched webpage against each numbered criterion, returning boolean `passed`, a one-sentence `reason`, and an overall `summary`. Payout math is never delegated to the AI.
 3. **Reliability & Safeguards**:
    - **JSON Validation Retry**: Invalid or schema-mismatched JSON responses automatically trigger 1 validation retry.
-   - **Transient Error Retries & Model Fallback**: On `503`, `429`, or timeouts, the server retries up to 3 times with a 2-second delay and then falls back through `GEMINI_FALLBACK_MODELS` (defaulting to `gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash`).
-   - **Fail-Safe Escrow**: If AI review fails, **no PayPal capture or void is executed**; both sides see a friendly error message and a **Try again** button.
+   - **Dynamic Model Discovery & Fallback**: At startup and every 30 minutes, TrustLance queries Gemini `ListModels` for available `generateContent` models, ranks `GEMINI_MODEL` and `GEMINI_FALLBACK_MODELS` (defaulting to `gemini-3.8-flash` followed by newer Flash models), retries busy `503`/`429`/timeout errors briefly, immediately skips retired/unavailable models, and remembers the last working model in memory.
+   - **Fail-Safe Escrow**: If AI review fails, **no PayPal capture or void is executed**; both sides see a friendly error message and a **Try again** button. Check live model readiness at `GET /api/health`.
 
 ---
 
@@ -112,8 +112,8 @@ TrustLance uses the official `@google/genai` SDK with strict JSON output mode (`
 | `PAYPAL_CLIENT_ID` | Yes | PayPal Sandbox REST app Client ID |
 | `PAYPAL_SECRET` | Yes | PayPal Sandbox REST app Secret |
 | `GEMINI_API_KEY` | Yes | Google AI Studio / Gemini API key |
-| `GEMINI_MODEL` | No | Primary Gemini model (defaults to `gemini-3.8-flash`) |
-| `GEMINI_FALLBACK_MODELS` | No | Comma-separated fallback models on 503/429/timeout (defaults to `gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash`) |
+| `GEMINI_MODEL` | No | Preferred primary Gemini model (defaults to `gemini-3.8-flash`; falls back automatically if unavailable) |
+| `GEMINI_FALLBACK_MODELS` | No | Optional comma-separated preferred fallback models before auto-discovered Gemini Flash models |
 | `BASE_URL` | Recommended | Public app origin without trailing slash (e.g. `https://your-app.onrender.com`); used for PayPal return/cancel URLs and generated share links |
 | `PORT` | No | Server listen port (defaults to `3000`; automatically provided on Render) |
 
